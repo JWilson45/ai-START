@@ -140,6 +140,67 @@ def build_app():
     builder.add_edge("tools", "call_model")
     return builder.compile(checkpointer=InMemorySaver())
 
+# --- Interrupt helpers (clean, testable) ---
+
+def _latest_ai_message(messages):
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            return m
+    return None
+
+
+def _print_ai(out) -> bool:
+    last_ai = _latest_ai_message(out.get("messages", []))
+    if last_ai and str(getattr(last_ai, "content", "")).strip():
+        print("AI:", last_ai.content, "\n")
+        return True
+    return False
+
+
+def _resume(app, config, payload):
+    return app.invoke(Command(resume=payload), config)
+
+
+def handle_interrupts(app, config, out):
+    """Process any pending interrupts in a single place.
+
+    Returns (out, printed_ai) where `out` is the updated graph output and
+    `printed_ai` indicates whether an AI reply was printed as part of handling.
+    """
+    printed_ai = False
+    while "__interrupt__" in out:
+        payload = out["__interrupt__"][0].value
+        if isinstance(payload, dict) and payload.get("tool") == "run_bash":
+            cmd = payload.get("command", "")
+            print(f"Tool request: run_bash\n$ {cmd}")
+            yn = input("Approve this single command? (y/n): ").strip().lower()
+            if yn == "y":
+                out = _resume(app, config, {"approve": True})
+                # Print tool output (latest ToolMessage from run_bash)
+                for m in reversed(out.get("messages", [])):
+                    if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
+                        print("\n―――― TOOL OUTPUT ――――")
+                        print(m.content)
+                        print("―――― END OUTPUT ――――\n")
+                        break
+                printed_ai = _print_ai(out)
+            else:
+                reason = input("Why deny? ").strip()
+                out = _resume(app, config, {"approve": False, "reason": reason})
+                # Print tool response (denied message from ToolMessage)
+                for m in reversed(out.get("messages", [])):
+                    if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
+                        print("\n―――― TOOL RESPONSE ――――")
+                        print(m.content)
+                        print("―――― END RESPONSE ――――\n")
+                        break
+                printed_ai = _print_ai(out)
+        else:
+            # Non-run_bash interrupts: resume once and exit loop
+            out = _resume(app, config, {"approve": False, "reason": "Non-run_bash interrupt"})
+            break
+    return out, printed_ai
+
 # --- CLI ---
 def main():
     print("Welcome — pirate CLI. Type 'exit' to quit.")
@@ -154,64 +215,11 @@ def main():
         out = app.invoke({"messages": [HumanMessage(content=user_input)]}, config)
         printed_ai = False
 
-        # Handle interrupts (tool approvals) until resolved
-        while "__interrupt__" in out:
-            payload = out["__interrupt__"][0].value
-            if isinstance(payload, dict) and payload.get("tool") == "run_bash":
-                cmd = payload.get("command", "")
-                print(f"Tool request: run_bash\n$ {cmd}")
-                yn = input("Approve this single command? (y/n): ").strip().lower()
-                if yn == "y":
-                    out = app.invoke(Command(resume={"approve": True}), config)
-                    # Print tool output (latest ToolMessage)
-                    for m in reversed(out.get("messages", [])):
-                        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
-                            print("\n―――― TOOL OUTPUT ――――")
-                            print(m.content)
-                            print("―――― END OUTPUT ――――\n")
-                            break
-                    # Immediately print assistant follow-up
-                    last_ai = None
-                    for m in reversed(out.get("messages", [])):
-                        if isinstance(m, AIMessage):
-                            last_ai = m
-                            break
-                    if last_ai and str(getattr(last_ai, "content", "")).strip():
-                        print("AI:", last_ai.content, "\n")
-                        printed_ai = True
-                else:
-                    reason = input("Why deny? ").strip()
-                    out = app.invoke(Command(resume={"approve": False, "reason": reason}), config)
-                    # Print tool response (denied message from ToolMessage)
-                    for m in reversed(out.get("messages", [])):
-                        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
-                            print("\n―――― TOOL RESPONSE ――――")
-                            print(m.content)
-                            print("―――― END RESPONSE ――――\n")
-                            break
-                    # Immediately print assistant follow-up
-                    last_ai = None
-                    for m in reversed(out.get("messages", [])):
-                        if isinstance(m, AIMessage):
-                            last_ai = m
-                            break
-                    if last_ai and str(getattr(last_ai, "content", "")).strip():
-                        print("AI:", last_ai.content, "\n")
-                        printed_ai = True
-            else:
-                # Non-run_bash interrupts are resumed once as "not approved" and then we break to print the model message
-                out = app.invoke(Command(resume={"approve": False, "reason": "Non-run_bash interrupt"}), config)
-                break
+        # Handle any pending interrupts (tool approvals) in one place
+        out, printed_ai = handle_interrupts(app, config, out)
 
         if not printed_ai:
-            last_ai = None
-            for m in reversed(out.get("messages", [])):
-                if isinstance(m, AIMessage):
-                    last_ai = m
-                    break
-            if last_ai and str(getattr(last_ai, "content", "")).strip():
-                print("AI:", last_ai.content, "\n")
-            else:
+            if not _print_ai(out):
                 print("AI:", "Ahoy! How can I assist ye today?", "\n")
 
 if __name__ == "__main__":
