@@ -24,27 +24,22 @@ def user_explicitly_requests_command(state: MessagesState) -> bool:
     starts_markers = ("run", "bash", "sh", "$", "!")
     return text.strip().startswith(starts_markers) or any(k in text for k in allow_markers)
 
-# Decide whether to route to ToolNode. Only allow if the latest HumanMessage
-# clearly requests running a command or mentions shell-related intent.
+# Decide whether to route to ToolNode based on the model's tool_calls
+# and whether the user explicitly asked for execution.
+# Returns only two keys: "tools" or "__end__".
 def guarded_tools_condition(state: MessagesState):
-    decision = tools_condition(state)
-    if decision in ("tools", "action"):
-        # Find the latest HumanMessage content
-        last_human: Optional[HumanMessage] = None
-        for m in reversed(state["messages"]):
-            if isinstance(m, HumanMessage):
-                last_human = m
-                break
-        text = (last_human.content or "").lower() if last_human else ""
-        # Heuristic: only allow tool if user explicitly requests/permits it
-        allow_markers = (
-            "run ", "execute", "bash", "shell", "command", "$ ",
-            "approve", "tool:", "!", "sudo", "ls", "echo ", "cat ", "python ", "pip "
-        )
-        starts_markers = ("run", "bash", "sh", "$", "!")
-        allow = text.strip().startswith(starts_markers) or any(k in text for k in allow_markers)
-        return "tools" if allow else "__end__"
-    return decision
+    # Find the last AI message
+    last_ai = None
+    for m in reversed(state["messages"]):
+        if isinstance(m, AIMessage):
+            last_ai = m
+            break
+    has_tool_call = bool(getattr(last_ai, "tool_calls", None))
+
+    # Only allow tools if (a) the model requested a tool AND (b) the user explicitly asked
+    if has_tool_call and user_explicitly_requests_command(state):
+        return "tools"
+    return "__end__"
 
 # --- Tool: run_bash (human approval required) ---
 @tool
@@ -56,6 +51,14 @@ def run_bash(command: str) -> str:
     approved = bool(decision.get("approve")) if isinstance(decision, dict) else False
 
     if approved:
+        # Safety: block compound or redirection operators; require a single, simple command
+        forbidden_tokens = ["&&", ";", "|", "`", "$(", ">>", ">", "<", "\n"]
+        if any(tok in command for tok in forbidden_tokens):
+            return (
+                f"[DENIED]\n$ {command}\n"
+                "Reason: multiple/compound or redirection operators are not allowed. "
+                "Please provide a single, safe command without &&, ;, |, backticks, subshells, or redirects."
+            )
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True)
             output = result.stdout or result.stderr or "(no output)"
@@ -121,10 +124,8 @@ def build_app():
         "call_model",
         guarded_tools_condition,
         {
-            "tools": "tools",     # common key => run ToolNode
-            "action": "tools",    # some builds return "action"
-            "__end__": END,       # no tool call => finish
-            "continue": END,      # legacy key for no tool
+            "tools": "tools",
+            "__end__": END,
         },
     )
     builder.add_edge("tools", "call_model")
@@ -142,6 +143,7 @@ def main():
             break
 
         out = app.invoke({"messages": [HumanMessage(content=user_input)]}, config)
+        printed_ai = False
 
         # Handle interrupts (tool approvals) until resolved
         while "__interrupt__" in out:
@@ -149,37 +151,59 @@ def main():
             if isinstance(payload, dict) and payload.get("tool") == "run_bash":
                 cmd = payload.get("command", "")
                 print(f"Tool request: run_bash\n$ {cmd}")
-                yn = input("Approve? (y/n): ").strip().lower()
+                yn = input("Approve this single command? (y/n): ").strip().lower()
                 if yn == "y":
                     out = app.invoke(Command(resume={"approve": True}), config)
-                    # If the tool ran, print its output directly (latest ToolMessage)
+                    # Print tool output (latest ToolMessage)
                     for m in reversed(out.get("messages", [])):
                         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
+                            print("\n―――― TOOL OUTPUT ――――")
                             print(m.content)
+                            print("―――― END OUTPUT ――――\n")
                             break
+                    # Immediately print assistant follow-up
+                    last_ai = None
+                    for m in reversed(out.get("messages", [])):
+                        if isinstance(m, AIMessage):
+                            last_ai = m
+                            break
+                    if last_ai and str(getattr(last_ai, "content", "")).strip():
+                        print("AI:", last_ai.content, "\n")
+                        printed_ai = True
                 else:
                     reason = input("Why deny? ").strip()
                     out = app.invoke(Command(resume={"approve": False, "reason": reason}), config)
-                    # If the tool ran, print its output directly (latest ToolMessage)
+                    # Print tool response (denied message from ToolMessage)
                     for m in reversed(out.get("messages", [])):
                         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "run_bash":
+                            print("\n―――― TOOL RESPONSE ――――")
                             print(m.content)
+                            print("―――― END RESPONSE ――――\n")
                             break
+                    # Immediately print assistant follow-up
+                    last_ai = None
+                    for m in reversed(out.get("messages", [])):
+                        if isinstance(m, AIMessage):
+                            last_ai = m
+                            break
+                    if last_ai and str(getattr(last_ai, "content", "")).strip():
+                        print("AI:", last_ai.content, "\n")
+                        printed_ai = True
             else:
                 # Non-run_bash interrupts are resumed once as "not approved" and then we break to print the model message
                 out = app.invoke(Command(resume={"approve": False, "reason": "Non-run_bash interrupt"}), config)
                 break
 
-        # Print the last AI response (not the tool message)
-        last_ai = None
-        for m in reversed(out.get("messages", [])):
-            if isinstance(m, AIMessage):
-                last_ai = m
-                break
-        if last_ai and str(getattr(last_ai, "content", "")).strip():
-            print("AI:", last_ai.content, "\n")
-        else:
-            print("AI:", "Ahoy! How can I assist ye today?", "\n")
+        if not printed_ai:
+            last_ai = None
+            for m in reversed(out.get("messages", [])):
+                if isinstance(m, AIMessage):
+                    last_ai = m
+                    break
+            if last_ai and str(getattr(last_ai, "content", "")).strip():
+                print("AI:", last_ai.content, "\n")
+            else:
+                print("AI:", "Ahoy! How can I assist ye today?", "\n")
 
 if __name__ == "__main__":
     main()
