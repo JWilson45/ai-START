@@ -1,4 +1,5 @@
 import subprocess
+import json
 from typing import Optional
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -9,43 +10,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import interrupt, Command
 
-# Helper: determine if the latest human explicitly requested a command
-def user_explicitly_requests_command(state: MessagesState) -> bool:
-    last_human: Optional[HumanMessage] = None
-    for m in reversed(state["messages"]):
-        if isinstance(m, HumanMessage):
-            last_human = m
-            break
-    text = (last_human.content or "").lower() if last_human else ""
-    allow_markers = (
-        "run ", "execute", "bash", "shell", "command", "$ ",
-        "approve", "tool:", "!", "sudo", "ls", "echo ", "cat ", "python ", "pip "
-    )
-    starts_markers = ("run", "bash", "sh", "$", "!")
-    return text.strip().startswith(starts_markers) or any(k in text for k in allow_markers)
-
-# Decide whether to route to ToolNode based on the model's tool_calls
-# and whether the user explicitly asked for execution.
-# Returns only two keys: "tools" or "__end__".
-def guarded_tools_condition(state: MessagesState):
-    # Find the last AI message
-    last_ai = None
-    for m in reversed(state["messages"]):
-        if isinstance(m, AIMessage):
-            last_ai = m
-            break
-    has_tool_call = bool(getattr(last_ai, "tool_calls", None))
-
-    # Only allow tools if (a) the model requested a tool AND (b) the user explicitly asked
-    if has_tool_call and user_explicitly_requests_command(state):
-        return "tools"
-    return "__end__"
-
 # --- Tool: run_bash (human approval required) ---
 @tool
 def run_bash(command: str) -> str:
     """
-    Prepare ONE shell command to execute **only if** running it is necessary or explicitly requested. This tool will pause for human approval via interrupt before execution. If approval is denied, the tool should return the denial details and you should continue the conversation without re-calling the tool unless a clearly safer single-command alternative exists.
+    Run ONE safe shell command on the user's machine when live output is required or explicitly requested.
+
+    Rules:
+    - Use only for local inspection tasks (files here, top process, disk usage, hostname/IP, env vars, version checks).
+    - Do NOT use for explanations or examples—answer in text instead.
+    - Single command only; no chaining, pipes, redirects, subshells.
+    - If ambiguous, ask for clarification instead of guessing.
+    - Always pauses for approval before running.
     """
     decision = interrupt({"tool": "run_bash", "command": command})
     approved = bool(decision.get("approve")) if isinstance(decision, dict) else False
@@ -54,38 +30,58 @@ def run_bash(command: str) -> str:
         # Safety: block compound or redirection operators; require a single, simple command
         forbidden_tokens = ["&&", ";", "|", "`", "$(", ">>", ">", "<", "\n"]
         if any(tok in command for tok in forbidden_tokens):
-            return (
-                f"[DENIED]\n$ {command}\n"
-                "Reason: multiple/compound or redirection operators are not allowed. "
-                "Please provide a single, safe command without &&, ;, |, backticks, subshells, or redirects."
-            )
+            return json.dumps({
+                "status": "denied",
+                "command": command,
+                "reason": "compound_or_redirection_operators_not_allowed",
+            })
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True)
             output = result.stdout or result.stderr or "(no output)"
-            return f"[EXECUTED]\n$ {command}\n{output}"
+            return json.dumps({
+                "status": "executed",
+                "command": command,
+                "returncode": result.returncode,
+                "output": output,
+            })
         except Exception as e:
-            return f"[ERROR] $ {command}\n{e}"
+            return json.dumps({
+                "status": "error",
+                "command": command,
+                "error": str(e),
+            })
 
     reason = (decision.get("reason") or "").strip() if isinstance(decision, dict) else ""
-    return (
-        f"[DENIED]\n$ {command}\n"
-        f"Reason: {reason or 'no reason provided'}\n"
-        "Please propose a safer/corrected command."
-    )
+    return json.dumps({
+        "status": "denied",
+        "command": command,
+        "reason": reason or "no reason provided",
+    })
 
 # --- Model + tools (native tool calling) ---
 llm = ChatOllama(model="llama3.2:3b", temperature=0)
+# llm = ChatOllama(model="gpt-oss:20b", temperature=0)
+
 tools = [run_bash]
 llm_with_tools = llm.bind_tools(tools)
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", """You talk like a pirate. Keep replies concise.
-IMPORTANT TOOL POLICY:
-- Only invoke the `run_bash` tool when executing a shell command is REQUIRED to complete the user's request or the user explicitly asks you to run a command.
-- If a normal conversational answer suffices, DO NOT call any tool—just reply.
-- When you do call `run_bash`, provide a single best-guess command. Do not chain multiple commands in one call.
-- After a denied tool run, propose a safer/corrected single command only if you can justify it; otherwise return to normal conversation.
-- If the user explicitly requests to run/execute a command (e.g., message starts with `$`, `!`, or the words `run`, `bash`, `execute`), you MUST call the `run_bash` tool with that single command.
+
+TOOL RULES:
+- Default to chat answers. Only call `run_bash` if live machine output is required (list files, top process, disk, hostname/IP, env, version check) or if user explicitly asks.
+- Pass exactly ONE safe command; no chaining/pipes/redirects/subshells.
+- At most one tool call per turn. If more is needed, ask first.
+- If ambiguous or risky, ask for clarification.
+
+EXAMPLES (no tool):
+Q: "What does `ps` do?" → Explain in text.
+Q: "How to check disk space?" → Suggest `df -h` in text.
+
+EXAMPLES (tool):
+Q: "List files in this folder" → `ls -la`
+Q: "Show top process" → `ps aux`
+Q: "$ whoami" → `whoami`
 """),
     MessagesPlaceholder("messages"),
 ])
@@ -95,12 +91,23 @@ def call_model_node(state: MessagesState):
     # Build prompt input with accumulated messages
     prompt_input = {"messages": state["messages"]}
 
-    # Let the model respond with or without tools; preserve tool_calls for routing
-    response = llm_with_tools.invoke(prompt.invoke(prompt_input))
+    # Enforce a ONE-tool-call budget per user turn by switching to a no-tools model
+    # if a ToolMessage already exists after the latest HumanMessage.
+    # Count ToolMessages since the last HumanMessage.
+    tool_calls_after_last_human = 0
+    seen_human = False
+    for m in reversed(state["messages"]):
+        if isinstance(m, HumanMessage):
+            seen_human = True
+            break
+        if isinstance(m, ToolMessage):
+            tool_calls_after_last_human += 1
+    tools_budget_exhausted = tool_calls_after_last_human >= 1
 
-    # If the model attempted a tool call but the user did NOT request execution, re-ask WITHOUT tools
-    if isinstance(response, AIMessage) and getattr(response, "tool_calls", None) and not user_explicitly_requests_command(state):
-        response = llm.invoke(prompt.invoke(prompt_input))
+    model_to_use = llm if tools_budget_exhausted else llm_with_tools
+
+    # Let the model respond with or without tools; preserve tool_calls for routing
+    response = model_to_use.invoke(prompt.invoke(prompt_input))
 
     # Normalize to AIMessage
     if isinstance(response, AIMessage):
@@ -122,10 +129,12 @@ def build_app():
     builder.add_edge(START, "call_model")
     builder.add_conditional_edges(
         "call_model",
-        guarded_tools_condition,
+        tools_condition,
         {
             "tools": "tools",
+            "action": "tools",
             "__end__": END,
+            "continue": END,
         },
     )
     builder.add_edge("tools", "call_model")
