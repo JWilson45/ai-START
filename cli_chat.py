@@ -1,7 +1,9 @@
 import subprocess
 import json
 from typing import Optional
+from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
@@ -9,6 +11,8 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import interrupt, Command
+
+load_dotenv()
 
 # --- Tool: run_bash (human approval required) ---
 @tool
@@ -59,8 +63,9 @@ def run_bash(command: str) -> str:
     })
 
 # --- Model + tools (native tool calling) ---
-llm = ChatOllama(model="llama3.2:3b", temperature=0)
-# llm = ChatOllama(model="gpt-oss:20b", temperature=0)
+# llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+# llm = ChatOllama(model="llama3.2:3b", temperature=0)
+llm = ChatOllama(model="gpt-oss:20b", temperature=0)
 
 tools = [run_bash]
 llm_with_tools = llm.bind_tools(tools)
