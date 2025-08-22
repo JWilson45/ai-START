@@ -44,7 +44,7 @@ async def main():
         print(out)
 
         last = out["messages"][-1]
-        print("AI:", last["content"], "\n")
+        print("AI:", last.content, "\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
