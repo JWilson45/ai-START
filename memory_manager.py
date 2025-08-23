@@ -17,7 +17,7 @@ RECENT_TURNS_TO_KEEP = 12
 
 logger = logging.getLogger(__name__)
 
-def _messages_stats(messages):
+def messages_stats(messages):
     total = len(messages)
     chars = 0
     tool_msgs = 0
@@ -314,7 +314,7 @@ class MemoryManager:
 
     def prepare_for_model(self, messages):
         """Single-pass prep: clamp tool outputs, keep last tool cycle, trim by tokens, and repair pairs."""
-        before = _messages_stats(messages)
+        before = messages_stats(messages)
         # Clamp tool outputs
         msgs = self._truncate_tool_outputs(messages)
         # Keep only last tool cycle after last Human
@@ -343,7 +343,7 @@ class MemoryManager:
 
         # Repair for OpenAI tool message invariants
         cleaned = self._drop_orphan_tools_and_invalid_groups(trimmed)
-        after = _messages_stats(cleaned)
+        after = messages_stats(cleaned)
 
         # Observability: if we start with a [SUMMARY], log its token count
         summary_msg, _ = self._ensure_summary_message(cleaned)

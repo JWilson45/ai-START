@@ -18,7 +18,7 @@ from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 
-from memory_manager import MemoryManager
+from memory_manager import MemoryManager, messages_stats
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -31,23 +31,6 @@ class State(TypedDict):
     # Our authoritative, compacted conversation memory that we fully replace each turn.
     history: list
 
-def _messages_stats(messages):
-    total = len(messages)
-    chars = 0
-    tool_msgs = 0
-    ai_with_tools = 0
-    for m in messages:
-        content = getattr(m, "content", "")
-        try:
-            chars += len(content) if isinstance(content, str) else 0
-        except Exception:
-            pass
-        from langchain_core.messages import ToolMessage, AIMessage
-        if isinstance(m, ToolMessage):
-            tool_msgs += 1
-        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-            ai_with_tools += 1
-    return {"count": total, "chars": chars, "tool_msgs": tool_msgs, "ai_with_tools": ai_with_tools}
 
 # Quiet noisy third-party logs while keeping our own DEBUG/INFO as configured
 for name, level in {"httpx": logging.WARNING, "openai": logging.WARNING, "langchain": logging.INFO}.items():
@@ -147,15 +130,15 @@ def call_model_node(state: State):
 
     # Working set for this turn = compacted history + current turn
     working_messages = prior_history + current_turn
-    logger.info("Phase: start; state=%s", _messages_stats(working_messages))
+    logger.info("Phase: start; state=%s", messages_stats(working_messages))
 
     # Summarize history if needed (roll-up old context)
     compact_messages = mm.summarize_history(working_messages)
-    logger.info("Phase: after summarize; state=%s", _messages_stats(compact_messages))
+    logger.info("Phase: after summarize; state=%s", messages_stats(compact_messages))
 
     # Build the model-facing view
     model_view = mm.prepare_for_model(compact_messages)
-    logger.info("Phase: model_view ready; view=%s", _messages_stats(model_view))
+    logger.info("Phase: model_view ready; view=%s", messages_stats(model_view))
 
     prompt_input = {"messages": model_view}
 
@@ -203,7 +186,7 @@ def call_model_node(state: State):
 
     # Replace authoritative history; only emit AI delta to messages for tool routing
     new_history = compact_messages + [msg]
-    logger.info("Phase: persist; new_history=%s", _messages_stats(new_history))
+    logger.info("Phase: persist; new_history=%s", messages_stats(new_history))
     return {"history": new_history, "messages": [msg]}
 
 def build_app():
