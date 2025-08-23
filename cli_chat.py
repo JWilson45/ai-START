@@ -1,16 +1,27 @@
 import subprocess
 import json
-from typing import Optional
+import os
+import sqlite3
 from dotenv import load_dotenv
-from langchain_ollama import ChatOllama
+# from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import interrupt, Command
+
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# Quiet noisy third-party logs while keeping our own DEBUG/INFO as configured
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("langchain").setLevel(logging.INFO)
 
 load_dotenv()
 
@@ -63,9 +74,9 @@ def run_bash(command: str) -> str:
     })
 
 # --- Model + tools (native tool calling) ---
-# llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 # llm = ChatOllama(model="llama3.2:3b", temperature=0)
-llm = ChatOllama(model="gpt-oss:20b", temperature=0)
+# llm = ChatOllama(model="gpt-oss:20b", temperature=0)
 
 tools = [run_bash]
 llm_with_tools = llm.bind_tools(tools)
@@ -76,17 +87,8 @@ prompt = ChatPromptTemplate.from_messages([
 TOOL RULES:
 - Default to chat answers. Only call `run_bash` if live machine output is required (list files, top process, disk, hostname/IP, env, version check) or if user explicitly asks.
 - Pass exactly ONE safe command; no chaining/pipes/redirects/subshells.
-- At most one tool call per turn. If more is needed, ask first.
+- At most one tool call per turn; if more is needed, ask first.
 - If ambiguous or risky, ask for clarification.
-
-EXAMPLES (no tool):
-Q: "What does `ps` do?" → Explain in text.
-Q: "How to check disk space?" → Suggest `df -h` in text.
-
-EXAMPLES (tool):
-Q: "List files in this folder" → `ls -la`
-Q: "Show top process" → `ps aux`
-Q: "$ whoami" → `whoami`
 """),
     MessagesPlaceholder("messages"),
 ])
@@ -100,10 +102,8 @@ def call_model_node(state: MessagesState):
     # if a ToolMessage already exists after the latest HumanMessage.
     # Count ToolMessages since the last HumanMessage.
     tool_calls_after_last_human = 0
-    seen_human = False
     for m in reversed(state["messages"]):
         if isinstance(m, HumanMessage):
-            seen_human = True
             break
         if isinstance(m, ToolMessage):
             tool_calls_after_last_human += 1
@@ -112,7 +112,9 @@ def call_model_node(state: MessagesState):
     model_to_use = llm if tools_budget_exhausted else llm_with_tools
 
     # Let the model respond with or without tools; preserve tool_calls for routing
-    response = model_to_use.invoke(prompt.invoke(prompt_input))
+    # Always wrap with OpenAI callback; if no OpenAI calls occur, totals will be zero
+    with get_openai_callback() as cb:
+        response = model_to_use.invoke(prompt.invoke(prompt_input))
 
     # Normalize to AIMessage
     if isinstance(response, AIMessage):
@@ -123,6 +125,20 @@ def call_model_node(state: MessagesState):
     # Ensure we never return an empty reply unless a tool call is present
     if (not getattr(msg, "content", "").strip()) and not getattr(msg, "tool_calls", None):
         msg = AIMessage(content="Aye! How be ye?")
+
+    logger.debug("call_model_node invoked, total messages: %d", len(state["messages"]))
+    logger.debug("AI response: %s", msg.content)
+
+    if getattr(cb, "total_tokens", 0) > 0:
+        logger.info(
+            "Token usage - prompt: %d, completion: %d, total: %d, cost: $%.4f",
+            cb.prompt_tokens,
+            cb.completion_tokens,
+            cb.total_tokens,
+            cb.total_cost,
+        )
+    else:
+        logger.info("Token usage - no OpenAI tokens recorded (non-OpenAI model or zero-token call)")
 
     return {"messages": state["messages"] + [msg]}
 
@@ -143,7 +159,14 @@ def build_app():
         },
     )
     builder.add_edge("tools", "call_model")
-    return builder.compile(checkpointer=InMemorySaver())
+    # Ensure a persistent state directory exists and use SQLite checkpointer (Option A)
+    state_dir = os.path.join(os.path.dirname(__file__), ".state")
+    os.makedirs(state_dir, exist_ok=True)
+    db_path = os.path.join(state_dir, "langgraph.sqlite")
+
+    cp = SqliteSaver(sqlite3.connect(db_path, check_same_thread=False))
+    logger.info("SQLite checkpointer initialized at %s", db_path)
+    return builder.compile(checkpointer=cp)
 
 # --- Interrupt helpers (clean, testable) ---
 
@@ -163,6 +186,7 @@ def _print_ai(out) -> bool:
 
 
 def _resume(app, config, payload):
+    logger.debug("Resuming with payload: %s", payload)
     return app.invoke(Command(resume=payload), config)
 
 
@@ -175,6 +199,7 @@ def handle_interrupts(app, config, out):
     printed_ai = False
     while "__interrupt__" in out:
         payload = out["__interrupt__"][0].value
+        logger.debug("Handling interrupt: %s", payload)
         if isinstance(payload, dict) and payload.get("tool") == "run_bash":
             cmd = payload.get("command", "")
             print(f"Tool request: run_bash\n$ {cmd}")
@@ -214,10 +239,12 @@ def main():
 
     while True:
         user_input = input("You: ")
+        logger.debug("User input: %s", user_input)
         if user_input.lower() in {"exit", "quit"}:
             break
 
         out = app.invoke({"messages": [HumanMessage(content=user_input)]}, config)
+        logger.debug("Graph output: %s", out)
         printed_ai = False
 
         # Handle any pending interrupts (tool approvals) in one place
