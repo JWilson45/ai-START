@@ -7,6 +7,14 @@ from langchain_core.messages.utils import trim_messages
 
 SUMMARY_PREFIX = "[SUMMARY]"
 
+# Token-based limits for the rolling SystemMessage summary
+MAX_SUMMARY_TOKENS = 500      # hard ceiling for the summary message (system)
+TARGET_SUMMARY_TOKENS = 350   # ask the model to aim for this size
+TARGET_BULLETS = 10           # keep the structure readable
+
+# Keep a small window of the most recent verbatim turns (before trimming)
+RECENT_TURNS_TO_KEEP = 12
+
 logger = logging.getLogger(__name__)
 
 def _messages_stats(messages):
@@ -144,10 +152,73 @@ class MemoryManager:
             return messages[0], messages[1:]
         return None, messages
 
+    def _num_tokens(self, text: str) -> int:
+        """Best-effort token count for a string using the LLM's counter; fallback to a rough heuristic."""
+        try:
+            # Many LangChain LLMs expose get_num_tokens
+            return int(self.llm.get_num_tokens(text))
+        except Exception:
+            # Heuristic: ~4 chars per token (English)
+            return max(1, len(text) // 4)
+
+    def _clip_to_tokens(self, text: str, max_tokens: int) -> str:
+        """Hard-clip text so its token count is <= max_tokens, using a couple of proportional passes."""
+        if self._num_tokens(text) <= max_tokens:
+            return text
+        # Proportional cut, then refine up to 3 passes
+        tokens = self._num_tokens(text)
+        # Keep a small safety margin
+        ratio = (max_tokens / tokens) * 0.98
+        new_len = max(1, int(len(text) * ratio))
+        clipped = text[:new_len]
+        # Refine passes if still over
+        for _ in range(3):
+            if self._num_tokens(clipped) <= max_tokens:
+                break
+            clipped = clipped[: max(1, int(len(clipped) * 0.9))]
+        if not clipped.endswith("…"):
+            clipped += "…"
+        return clipped
+
+    def _compress_summary_tokens(self, prior_summary_text: str, new_chunk_messages: list) -> str:
+        """
+        Re-compress the prior summary + new chunk into a fresh, token-bounded summary.
+        Returns plain text (no [SUMMARY] header).
+        """
+        sanitized_chunk = self._sanitize_for_summary(new_chunk_messages)
+
+        prompt = [
+            SystemMessage(content=(
+                "You maintain a rolling conversation summary used as a SystemMessage for an LLM.\n"
+                f"Rewrite the summary to be as informative as possible while staying UNDER {TARGET_SUMMARY_TOKENS} tokens and around {TARGET_BULLETS} bullet points.\n"
+                "Keep ONLY durable facts, decisions, open questions, user preferences, and canonical names/ids.\n"
+                "Prefer specificity over fluff; remove duplicates and obsolete items. If there is available room, include brief concrete examples."
+            )),
+            SystemMessage(content="Existing summary:\n" + (prior_summary_text or "(none)")),
+            SystemMessage(content="New conversation chunk follows; integrate only durable, salient points.")
+        ] + sanitized_chunk
+
+        try:
+            compressed = self.llm.invoke(prompt).content or ""
+        except Exception as e:
+            compressed = f"(compression failed: {e})"
+
+        # Final enforcement: hard-clip to MAX_SUMMARY_TOKENS
+        tokens_before = self._num_tokens(compressed)
+        if tokens_before > MAX_SUMMARY_TOKENS:
+            clipped = self._clip_to_tokens(compressed, MAX_SUMMARY_TOKENS)
+            logger.info("Token-clip summary: %d -> %d tokens (max=%d)", tokens_before, self._num_tokens(clipped), MAX_SUMMARY_TOKENS)
+            compressed = clipped
+        else:
+            logger.info("Compressed summary tokens=%d (target<=%d)", tokens_before, TARGET_SUMMARY_TOKENS)
+
+        return compressed
+
     def summarize_history(self, messages):
         """Roll up the earliest chunk of history into a single [SUMMARY] SystemMessage."""
         summary_msg, rest = self._ensure_summary_message(messages)
         non_summary = list(rest)
+        logger.info("Non-summary count=%d (threshold=%d)", len(non_summary), self.max_stored_messages)
         if len(non_summary) <= self.max_stored_messages:
             return messages
         chunk = non_summary[:self.summary_chunk_size]
@@ -155,22 +226,14 @@ class MemoryManager:
 
         logger.info("Summarizing history: chunk=%d; remainder=%d", len(chunk), len(remainder))
         sanitized_chunk = self._sanitize_for_summary(chunk)
-        summary_prompt = [
-            SystemMessage(content=(
-                "Condense the following conversation chunk into 8-10 bullet points focusing on facts, decisions, "
-                "open questions, and user preferences. Be specific and avoid fluff."
-            ))
-        ] + sanitized_chunk
-        try:
-            new_summary_text = self.llm.invoke(summary_prompt).content
-        except Exception as e:
-            new_summary_text = f"(failed to summarize chunk due to {e})"
-        preview = (new_summary_text or "").replace("\n", " ")[:200]
-        logger.info("Summary result: %d chars; preview=\"%s\"", len(new_summary_text or ""), preview)
 
-        combined_text = new_summary_text if summary_msg is None else f"{summary_msg.content}\n\n{new_summary_text}"
-        new_summary_msg = SystemMessage(content=f"{SUMMARY_PREFIX}\n{combined_text}")
-        logger.info("New summary SystemMessage created; length=%d", len(new_summary_msg.content))
+        prior_summary_text = summary_msg.content[len(SUMMARY_PREFIX):].lstrip() if summary_msg else ""
+        compressed = self._compress_summary_tokens(prior_summary_text, sanitized_chunk)
+        new_summary_msg = SystemMessage(content=f"{SUMMARY_PREFIX}\n{compressed}")
+        logger.info(
+            "New summary SystemMessage: tokens=%d (max=%d), chars=%d",
+            self._num_tokens(new_summary_msg.content), MAX_SUMMARY_TOKENS, len(new_summary_msg.content)
+        )
         logger.info("New summary SystemMessage content:\n%s", new_summary_msg.content)
         return [new_summary_msg] + remainder
 
@@ -243,6 +306,12 @@ class MemoryManager:
                 i += 1
         return cleaned
 
+    def _tail_recent_turns(self, messages, n: int):
+        """Return the last n messages from the *non-summary* portion."""
+        summary_msg, rest = self._ensure_summary_message(messages)
+        tail = rest[-n:] if n > 0 else []
+        return ([summary_msg] if summary_msg else []) + tail
+
     def prepare_for_model(self, messages):
         """Single-pass prep: clamp tool outputs, keep last tool cycle, trim by tokens, and repair pairs."""
         before = _messages_stats(messages)
@@ -250,6 +319,14 @@ class MemoryManager:
         msgs = self._truncate_tool_outputs(messages)
         # Keep only last tool cycle after last Human
         msgs = self._keep_last_tool_cycle(msgs)
+
+        # Ensure we always keep a small recent window verbatim
+        protected_tail = self._tail_recent_turns(msgs, RECENT_TURNS_TO_KEEP)
+        # Build a set of ids to compare object identity safely
+        protected_ids = {id(m) for m in protected_tail}
+        # Move protected_tail to the end (stable order), keeping everything else before
+        base = [m for m in msgs if id(m) not in protected_ids]
+        msgs = base + protected_tail
 
         # Use trim_messages with strategy='last'
         try:
@@ -267,5 +344,14 @@ class MemoryManager:
         # Repair for OpenAI tool message invariants
         cleaned = self._drop_orphan_tools_and_invalid_groups(trimmed)
         after = _messages_stats(cleaned)
+
+        # Observability: if we start with a [SUMMARY], log its token count
+        summary_msg, _ = self._ensure_summary_message(cleaned)
+        if summary_msg:
+            try:
+                logger.info("Summary tokens now=%d", self._num_tokens(summary_msg.content))
+            except Exception:
+                pass
+
         logger.info("prepare_for_model: before=%s -> after=%s (token_budget=%d)", before, after, self.max_model_tokens)
         return cleaned
