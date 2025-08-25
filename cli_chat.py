@@ -4,7 +4,7 @@ import os
 import sqlite3
 from dotenv import load_dotenv
 # from langchain_ollama import ChatOllama
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -19,6 +19,12 @@ from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 
 from memory_manager import MemoryManager, messages_stats
+
+import glob
+import hashlib
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -86,12 +92,233 @@ def run_bash(command: str) -> str:
         "reason": reason or "no reason provided",
     })
 
+# --- Vector store (Chroma) + RAG helpers ---
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+DEFAULT_COLLECTION = "kb_main"
+
+import re
+COLL_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{1,510})[a-zA-Z0-9]$")
+
+def _sanitize_collection_name(name: str) -> str:
+    """Coerce a user-provided collection name to Chroma's constraints.
+    Rules: 3-512 chars, [a-zA-Z0-9._-], start/end alnum.
+    """
+    if not isinstance(name, str):
+        name = str(name or "kb_main")
+    # Replace disallowed chars with '-'
+    name = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
+    # Ensure starts/ends with alnum
+    if not name or not name[0].isalnum():
+        name = f"k{name}"
+    if not name[-1].isalnum():
+        name = f"{name}0"
+    # Enforce min length 3
+    while len(name) < 3:
+        name += "0"
+    # Enforce max length 512
+    name = name[:512]
+    # Final check; if still invalid, fall back
+    if not COLL_RE.match(name):
+        return "kb_main"
+    return name
+
+
+def _ensure_persist_dir(subdir: str) -> str:
+    base = os.path.join(os.path.dirname(__file__), ".state", subdir)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _vectorstore(collection_name: str = DEFAULT_COLLECTION) -> Chroma:
+    """
+    Return a persistent Chroma vector store located under ./.state/chroma
+    configured with OpenAI embeddings (text-embedding-3-small).
+    """
+    original = collection_name
+    collection_name = _sanitize_collection_name(collection_name)
+    if original != collection_name:
+        logger.info("Sanitized collection name: '%s' -> '%s'", original, collection_name)
+    persist_directory = _ensure_persist_dir("chroma")
+    try:
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        vs = Chroma(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            embedding_function=embeddings,
+        )
+        logger.info("Chroma vectorstore ready: collection=%s dir=%s", collection_name, persist_directory)
+        return vs
+    except Exception as e:
+        logger.exception("Vectorstore init failed: %s", e)
+        raise
+
+
+def _expand_paths(path_or_glob: str) -> list[str]:
+    # Accept file, directory, or glob. Return concrete file list.
+    p = os.path.expanduser(path_or_glob)
+    if os.path.isdir(p):
+        # Recurse common doc types inside a directory
+        files = []
+        for ext in ("**/*.pdf", "**/*.txt", "**/*.md"):
+            files.extend(glob.glob(os.path.join(p, ext), recursive=True))
+        return sorted(files)
+    # Glob or single file
+    matches = glob.glob(p, recursive=True)
+    return sorted([m for m in matches if os.path.isfile(m)])
+
+
+def _load_documents(paths: list[str]):
+    docs = []
+    for fp in paths:
+        try:
+            if fp.lower().endswith(".pdf"):
+                loader = PyPDFLoader(fp)
+                docs.extend(loader.load())
+            elif fp.lower().endswith((".txt", ".md")):
+                loader = TextLoader(fp, encoding="utf-8")
+                docs.extend(loader.load())
+        except Exception as e:
+            logger.warning("Skipping %s (%s)", fp, e)
+    return docs
+
+
+def _chunk_documents(docs):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    return splitter.split_documents(docs)
+
+
+def _ids_for_docs(docs) -> list[str]:
+    ids = []
+    for d in docs:
+        src = str(d.metadata.get("source", ""))
+        page = str(d.metadata.get("page", ""))
+        h = hashlib.sha1((d.page_content + "|" + src + "|" + page).encode("utf-8", errors="ignore")).hexdigest()
+        ids.append(h)
+    return ids
+
+
+@tool
+def ingest_documents(path: str, collection: str = DEFAULT_COLLECTION) -> str:
+    """
+    Ingest local files into the persistent Chroma vector store.
+
+    Args:
+    - path: A file path, directory, or glob (supports .pdf, .txt, .md)
+    - collection: Optional Chroma collection name (default: "kb")
+
+    Behavior:
+    - Loads PDFs via PyPDFLoader and text/Markdown via TextLoader
+    - Splits into ~1000-char chunks with 150 overlap
+    - Embeds with OpenAI `text-embedding-3-small` and upserts into Chroma
+    - Deduplicates by content hash-based IDs
+    """
+    logger.info("Ingest starting: path=%s collection=%s", path, collection)
+    files = _expand_paths(path)
+    logger.info("Expand paths -> %d files: %s", len(files), files)
+    if not files:
+        return json.dumps({
+            "status": "no_files_found",
+            "path": path,
+        })
+
+    raw_docs = _load_documents(files)
+    logger.info("Loaded %d docs", len(raw_docs))
+    if not raw_docs:
+        return json.dumps({
+            "status": "load_failed",
+            "path": path,
+            "files": files,
+        })
+
+    chunks = _chunk_documents(raw_docs)
+    logger.info("Chunked into %d chunks", len(chunks))
+    if not chunks:
+        return json.dumps({
+            "status": "no_chunks",
+            "path": path,
+        })
+
+    try:
+        vs = _vectorstore(collection)
+        ids = _ids_for_docs(chunks)
+        logger.info("Generated %d ids", len(ids))
+        vs.add_documents(documents=chunks, ids=ids)
+        logger.info("Upserted %d chunks to Chroma collection=%s", len(chunks), collection)
+    except Exception as e:
+        # Common causes: missing OPENAI_API_KEY, network error, incompatible chroma/langchain versions
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        masked = (api_key[:6] + "…") if api_key else "(missing)"
+        logger.exception("Ingest failed during vectorstore/add_documents: %s", e)
+        return json.dumps({
+            "status": "error",
+            "stage": "vectorstore_or_upsert",
+            "reason": str(e),
+            "openai_api_key": masked,
+            "collection": collection,
+        })
+    # Chroma persists automatically when persist_directory is set
+
+    return json.dumps({
+        "status": "ingested",
+        "path": path,
+        "files_count": len(files),
+        "chunks_upserted": len(chunks),
+        "collection": collection,
+        "persist_dir": _ensure_persist_dir("chroma"),
+    })
+
+
+@tool
+def search_corpus(query: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> str:
+    """
+    Retrieve top-k chunks from the Chroma vector store and return structured results.
+
+    Args:
+    - query: The search query
+    - k: number of results (default 5)
+    - collection: Chroma collection name (default "kb")
+
+    Returns JSON with fields: query, k, results=[{score, snippet, source, page}]
+    """
+    if not query or not query.strip():
+        return json.dumps({"status": "error", "reason": "empty_query"})
+
+    vs = _vectorstore(collection)
+    try:
+        docs_scores = vs.similarity_search_with_score(query, k=k)
+        logger.info("Search: query='%s' k=%d -> %d hits", query, k, len(docs_scores))
+    except Exception as e:
+        logger.exception("Search failed: %s", e)
+        return json.dumps({"status": "error", "reason": str(e)})
+
+    results = []
+    for doc, score in docs_scores:
+        meta = doc.metadata or {}
+        results.append({
+            "score": float(score),
+            "snippet": doc.page_content[:500],
+            "source": meta.get("source"),
+            "page": meta.get("page"),
+        })
+
+    return json.dumps({
+        "status": "ok",
+        "query": query,
+        "k": k,
+        "collection": collection,
+        "results": results,
+    })
+
 # --- Model + tools (native tool calling) ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 # llm = ChatOllama(model="llama3.2:3b", temperature=0)
 # llm = ChatOllama(model="gpt-oss:20b", temperature=0)
 
-tools = [run_bash]
+tools = [run_bash, ingest_documents, search_corpus]
 llm_with_tools = llm.bind_tools(tools)
 
 # --- Memory management helpers (trim, summarize, clamp tool outputs) ---
@@ -116,6 +343,12 @@ TOOL RULES:
 - Pass exactly ONE safe command; no chaining/pipes/redirects/subshells.
 - At most one tool call per turn; if more is needed, ask first.
 - If ambiguous or risky, ask for clarification.
+
+RAG RULES:
+- To **ingest** user documents into the knowledge base, call `ingest_documents(path, collection?)` where `path` may be a file, directory, or glob (supports .pdf/.txt/.md). Use chunk_size≈1000 and overlap≈150 (handled by the tool).
+- To **answer questions about the user's docs**, first call `search_corpus(query, k=5, collection?)`. Then write the answer **using only retrieved snippets**. Add a short **Sources** list mapping to each snippet's `source` (and `page` if present).
+- If retrieval returns nothing useful, say so and proceed with a normal chat answer (no hallucinations).
+- If ingestion/search errors persist, you may call `diag_vectorstore()` once to report environment issues (API key, Chroma init).
 """),
     MessagesPlaceholder("messages"),
 ])
