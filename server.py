@@ -8,12 +8,9 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, BaseMessage
